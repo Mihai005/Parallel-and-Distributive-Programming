@@ -116,8 +116,6 @@ private:
 
 	void movesBetweenWarehousesGlobal()
 	{
-		std::scoped_lock lock(mtxGlobal);
-
 		int src = rand() % nrOfWarehouses;
 		int dest = rand() % nrOfWarehouses;
 
@@ -126,6 +124,8 @@ private:
 
 		int product = rand() % warehouseCapacity;
 		int amount = rand() % 100 + 1;
+
+		std::scoped_lock lock(mtxGlobal);
 
 		if (warehouses[src][product] >= amount)
 		{
