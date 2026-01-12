@@ -1,84 +1,76 @@
 #include <iostream>
 #include <mpi.h>
-#include "dsm.h"
 #include <string>
+#include <thread>
+#include <chrono>
+#include "dsm.h"
+
+void log(int rank, std::string msg) {
+    printf("[Rank %d] %s\n", rank, msg.c_str());
+}
+
+void sleep_ms(int ms) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
 
 int main(int argc, char** argv)
 {
     DSM dsm(argc, argv);
-
     int rank = dsm.getMyRank();
 
-    if (rank == 0) { dsm.subscribe("var_0"); dsm.subscribe("var_2"); }
-    if (rank == 1) { dsm.subscribe("var_0"); dsm.subscribe("var_1"); dsm.subscribe("var_2"); }
-    if (rank == 2) { dsm.subscribe("var_1"); dsm.subscribe("var_2"); }
-
     MPI_Barrier(MPI_COMM_WORLD);
-   
-    if (rank == 0)
-    {
-        printf("\n[Rank 0] Writing 111 to var_0\n");
-        dsm.write("var_0", 111);
-    }
+    if (rank == 0) log(rank, "--- STARTING DSM TEST SUITE ---");
 
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-
-    if (rank == 1)
-    {
-        printf("[Rank 1] Read var_0: %d (Expected: 111)\n", dsm.read("var_0"));
-    }
-    if (rank == 2)
-    {
-        // Rank 2 isn't subscribed. It never gets the message.
-        // Reading it returns 0 (default map value).
-        printf("[Rank 2] Read var_0: %d (Expected: 0 / Not 111)\n", dsm.read("var_0"));
-    }
-
+    // -------------------------------
+    // Test 1: Partial subscription
+    // -------------------------------
     MPI_Barrier(MPI_COMM_WORLD);
+    if (rank == 0) log(rank, "--- TEST 1: PARTIAL SUBSCRIPTION ---");
+    if (rank == 0) dsm.write("var_0", 111);
+    sleep_ms(200);
 
-    // ---------------------------------------------------------
-    // TEST 2: BLIND WRITE
-    // Rank 0 writes 888 to var_1 (Owner is 1).
-    // Rank 0 is NOT subscribed. It sends request, but gets no update back.
-    // Rank 2 IS subscribed. It should get the update.
-    // ---------------------------------------------------------
+    if (rank == 1) log(rank, "Read var_0: " + std::to_string(dsm.read("var_0")) + " (Expected: 111)");
+    if (rank == 2) log(rank, "Read var_0: " + std::to_string(dsm.read("var_0")) + " (Expected: 0)");
 
-    if (rank == 0)
-    {
-        printf("\n[Rank 0] Writing 888 to var_1 (I am not a subscriber)\n");
-        dsm.write("var_1", 888);
-    }
-
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-
-    if (rank == 2)
-    {
-        printf("[Rank 2] Read var_1: %d (Expected: 0 / Not 888)\n", dsm.read("var_1"));
-    }
-    if (rank == 0)
-    {
-        // Rank 0 sent the write request, but is not in the subscriber list.
-        // It never received the 'Tag 0' update msg. 
-        // Local value remains default (0).
-        printf("[Rank 0] Read var_1: %d (Expected: 0 / Not 888)\n", dsm.read("var_1"));
-    }
-
+    // -------------------------------
+    // Test 2: Permission check
+    // -------------------------------
     MPI_Barrier(MPI_COMM_WORLD);
+    if (rank == 0) log(rank, "--- TEST 2: PERMISSION CHECK ---");
+    if (rank == 0) dsm.write("var_1", 888);
+    sleep_ms(200);
 
-    // ---------------------------------------------------------
-    // TEST 3: GLOBAL VARIABLE
-    // Everyone subscribes to var_2.
-    // ---------------------------------------------------------
+    if (rank == 0) log(rank, "Read var_1: " + std::to_string(dsm.read("var_1")) + " (Expected: 0)");
+    if (rank == 2) log(rank, "Read var_1: " + std::to_string(dsm.read("var_1")) + " (Expected: 0)");
 
-    if (rank == 2)
-    {
-        printf("\n[Rank 2] Writing 999 to var_2 (Global)\n");
-        dsm.write("var_2", 999);
+    // -------------------------------
+    // Test 3: Global variable
+    // -------------------------------
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (rank == 0) log(rank, "--- TEST 3: GLOBAL VARIABLE ---");
+    if (rank == 2) dsm.write("var_2", 999);
+    sleep_ms(200);
+
+    log(rank, "Final var_2: " + std::to_string(dsm.read("var_2")) + " (Expected: 999)");
+
+    // -------------------------------
+    // Test 4: Topology ping-pong
+    // -------------------------------
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (rank == 0) log(rank, "--- TEST 4: PING-PONG CHAIN ---");
+
+    if (rank == 0) { sleep_ms(100); dsm.write("var_0", 100); }
+    else if (rank == 1) {
+        int val = 0;
+        while (val != 100) { val = dsm.read("var_0"); sleep_ms(10); }
+        log(rank, "Forwarding 200 to var_1...");
+        dsm.write("var_1", 200);
     }
-
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-
-    printf("[Rank %d] Final var_2: %d (Expected: 999)\n", rank, dsm.read("var_2"));
+    else if (rank == 2) {
+        int val = 0;
+        while (val != 200) { val = dsm.read("var_1"); sleep_ms(10); }
+        log(rank, "Chain complete.");
+    }
 
     return 0;
 }

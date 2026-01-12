@@ -1,246 +1,275 @@
 #include "dsm.h"
+#include <cstring>
+#include <algorithm>
+#include <iostream>
 
-DSM::DSM(int argc, char**argv)
+DSM::DSM(int argc, char** argv) : keepRunning(true), lamportClock(0)
 {
-	int provided;
-	MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    int provided;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
 
-	if (provided < MPI_THREAD_MULTIPLE) 
-	{
-		printf("Error: The MPI library does not support full threading.\n");
-		MPI_Abort(MPI_COMM_WORLD, 1);
-	}
-	
-	lamportClock = 0;
-	initTopology();
-	keepRunning = true;
-	listenerThread = std::thread(&DSM::listen, this);
-}
+    if (provided < MPI_THREAD_MULTIPLE) {
+        printf("Error: MPI does not support full threading.\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
 
-void DSM::initTopology()
-{
-	subscriberList["var_0"] = { 0, 1 };
-	subscriberList["var_1"] = { 1, 2 };
-	subscriberList["var_2"] = { 0, 1, 2 };
-}
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-void DSM::subscribe(std::string varName)
-{
-	if (data.find(varName) == data.end())
-	{
-		data[varName] = 0;
-	}
+    lastKnownTime.resize(size, 0);
+
+    initTopology();
+
+    listenerThread = std::thread(&DSM::listen, this);
 }
 
 DSM::~DSM()
 {
-	keepRunning = false;
-
-	if (listenerThread.joinable()) 
-	{
-		listenerThread.join();
-	}
-
-	MPI_Finalize();
+    keepRunning = false;
+    if (listenerThread.joinable()) {
+        listenerThread.join();
+    }
+    MPI_Finalize();
 }
 
-int DSM::getMyRank()
+void DSM::initTopology()
 {
-	int rank;
-	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-	return rank;
+    subscriberList["var_0"] = { 0, 1 };
+    subscriberList["var_1"] = { 1, 2 };
+    subscriberList["var_2"] = { 0, 1, 2 };
+
+    for (auto& pair : subscriberList) {
+        bool amISub = false;
+        for (int s : pair.second) {
+            if (s == rank) { amISub = true; break; }
+        }
+        if (amISub) {
+            subscribe(pair.first);
+        }
+    }
 }
 
-int DSM::getOwnerOfVariable(std::string varName)
+void DSM::subscribe(std::string varName)
 {
-	return varName[4] - '0';
+    subscriptions[varName] = true;
+    if (data.find(varName) == data.end()) {
+        data[varName] = 0;
+    }
+}
+
+void DSM::setCallback(std::function<void(std::string, int)> cb)
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    updateCallback = cb;
 }
 
 int DSM::read(std::string varName)
 {
-	std::lock_guard<std::mutex> g(mtx);
-	return data[varName];
+    std::lock_guard<std::mutex> g(mtx);
+    if (data.find(varName) != data.end()) return data[varName];
+    return 0;
+}
+
+void DSM::tick(int receivedTime)
+{
+    lamportClock = std::max(lamportClock, receivedTime) + 1;
 }
 
 void DSM::write(std::string varName, int value)
-{   
-	{
-		std::lock_guard<std::mutex> lock(mtx);
-		if (data.find(varName) == data.end())
-		{
-			return;
-		}
-	}
-
-	WriteMessage m;
-	strcpy(m.varName, varName.c_str());
-	m.value = value;
-	int myRank = getMyRank();
-	int destRank = getOwnerOfVariable(varName);
-
-	if (myRank == destRank)
-	{
-		{
-			std::lock_guard<std::mutex> lock(mtx);
-			data[varName] = value;
-		}
-		
-		std::vector<int>& subscribers = subscriberList[varName];
-		for (const int& s : subscribers)
-		{
-			if (s == myRank) continue;
-			MPI_Send(&m, sizeof(m), MPI_BYTE, s, 0, MPI_COMM_WORLD); // 0 means I'm the leader and I broadcast the change
-		}
-	}
-	else 
-	{
-		MPI_Send(&m, sizeof(m), MPI_BYTE, destRank, 1, MPI_COMM_WORLD); // 1 means I'm the worker and I try to update the leaders variable
-	}
-}
-
-void DSM::broadcastUpdate(std::string varName, int value)
 {
-	WriteMessage m;
-	strcpy(m.varName, varName.c_str());
-	m.value = value;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (subscriptions.find(varName) == subscriptions.end()) {
+            printf("[Rank %d] Error: Cannot write to '%s' (Not Subscribed)\n", rank, varName.c_str());
+            return;
+        }
+    }
 
-	std::vector<int>& subscribers = subscriberList[varName];
-	for (const int& s : subscribers)
-	{
-		if (s == getMyRank()) continue;
-		MPI_Send(&m, sizeof(m), MPI_BYTE, s, 0, MPI_COMM_WORLD); // 0 means I'm the leader and I broadcast the change
-	}
+    int myTime;
+    {
+        std::lock_guard<std::mutex> lock(queueMtx);
+        tick();
+        myTime = lamportClock;
+        lastKnownTime[rank] = lamportClock;
+    }
+
+    LamportMessage msg;
+    strcpy(msg.varName, varName.c_str());
+    msg.value = value;
+    msg.senderRank = rank;
+    msg.timestamp = myTime;
+    msg.isCAS = false;
+    msg.expectedValue = 0;
+
+    if (subscriberList.count(varName)) {
+        const std::vector<int>& targets = subscriberList[varName];
+        for (int target : targets) {
+            MPI_Send(&msg, sizeof(msg), MPI_BYTE, target, TAG_LAMPORT_MSG, MPI_COMM_WORLD);
+        }
+    }
 }
 
 bool DSM::compareAndExchange(std::string varName, int expectedValue, int newValue)
 {
-	int myRank = getMyRank();
-	int destRank = getOwnerOfVariable(varName);
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (subscriptions.find(varName) == subscriptions.end()) 
+        {
+            printf("[Rank %d] Error: Cannot CAS '%s' (Not Subscribed)\n", rank, varName.c_str());
+            return false;
+        }
+    }
 
-	{
-		std::lock_guard<std::mutex> lock(mtx);
-		if (data.find(varName) == data.end())
-		{
-			return false;
-		}
-	}
+    int myTime;
+    std::future<bool> resultFuture;
 
-	if (myRank == destRank)
-	{
-		std::lock_guard<std::mutex> lock(mtx);
-		
-		if (data[varName] == expectedValue)
-		{
-			data[varName] = newValue;
-			broadcastUpdate(varName, newValue);
-			return true;
-		}
+    {
+        std::lock_guard<std::mutex> lock(queueMtx);
+        tick();
+        myTime = lamportClock;
+        lastKnownTime[rank] = lamportClock;
 
-		return false;
-	}
+        std::lock_guard<std::mutex> pLock(casPromiseMtx);
+        casPromises[myTime] = std::promise<bool>();
+        resultFuture = casPromises[myTime].get_future();
+    }
 
-	std::future<CASResponse> futureResult;
-	{
-		std::lock_guard<std::mutex> casLock (casMtx);
-		pendingCAS[varName] = std::promise<CASResponse>();
-		futureResult = pendingCAS[varName].get_future();
-	}
+    LamportMessage msg;
+    strcpy(msg.varName, varName.c_str());
+    msg.value = newValue;
+    msg.senderRank = rank;
+    msg.timestamp = myTime;
+    msg.isCAS = true;
+    msg.expectedValue = expectedValue;
 
-	CASMessage message;
-	strcpy(message.varName, varName.c_str());
-	message.expectedValue = expectedValue;
-	message.newValue = newValue;
+    if (subscriberList.count(varName)) {
+        const std::vector<int>& targets = subscriberList[varName];
+        for (int target : targets) 
+        {
+            MPI_Send(&msg, sizeof(msg), MPI_BYTE, target, TAG_LAMPORT_MSG, MPI_COMM_WORLD);
+        }
+    }
 
-	MPI_Send(&message, sizeof(message), MPI_BYTE, destRank, 2, MPI_COMM_WORLD); // tag 2 for sending CAS request to owner of variable
-
-	return futureResult.get().result;
+    return resultFuture.get();
 }
 
 void DSM::listen()
 {
-	MPI_Status status;
-	int flag = 0;
+    MPI_Status status;
+    int flag = 0;
 
-	while (keepRunning)
-	{
-		MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &status);
+    while (keepRunning)
+    {
+        MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &status);
 
-		if (flag)
-		{
-			switch (status.MPI_TAG)
-			{
-			case 0:
-			{
-				WriteMessage msg;
-				MPI_Recv(&msg, sizeof(msg), MPI_BYTE, status.MPI_SOURCE, status.MPI_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-				handleWrite(msg);
-				break;
-			}
+        if (flag)
+        {
+            if (status.MPI_TAG == TAG_LAMPORT_MSG)
+            {
+                LamportMessage msg;
+                MPI_Recv(&msg, sizeof(msg), MPI_BYTE, status.MPI_SOURCE, TAG_LAMPORT_MSG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-			case 1:
-			{
-				WriteMessage msg;
-				MPI_Recv(&msg, sizeof(msg), MPI_BYTE, status.MPI_SOURCE, status.MPI_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-				write(msg.varName, msg.value);
-				break;
-			}
+                std::lock_guard<std::mutex> lock(queueMtx);
 
-			case 2:
-			{
-				CASMessage msg;
-				MPI_Recv(&msg, sizeof(msg), MPI_BYTE, status.MPI_SOURCE, status.MPI_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-				handleCAS(msg, status.MPI_SOURCE);
-				break;
-			}
+                tick(msg.timestamp);
 
-			case 3:
-			{
-				CASResponse response;
-				MPI_Recv(&response, sizeof(response), MPI_BYTE, status.MPI_SOURCE, status.MPI_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-				std::lock_guard<std::mutex> casLock(casMtx);
+                lastKnownTime[status.MPI_SOURCE] = std::max(lastKnownTime[status.MPI_SOURCE], msg.timestamp);
 
-				if (pendingCAS.count(response.varName))
-				{
-					pendingCAS[response.varName].set_value(response);
-					pendingCAS.erase(response.varName);
-				}
+                holdbackQueue.push(msg);
 
-				break;
-			}
+                int ackTime = lamportClock;
+                if (subscriberList.count(msg.varName)) {
+                    for (int target : subscriberList[msg.varName]) {
+                        if (target != rank)
+                            MPI_Send(&ackTime, 1, MPI_INT, target, TAG_LAMPORT_ACK, MPI_COMM_WORLD);
+                    }
+                }
 
-			default:
-				std::cout << "Unknown tag received: " << status.MPI_TAG << "\n";
-				MPI_Recv(NULL, 0, MPI_BYTE, status.MPI_SOURCE, status.MPI_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-				break;
-			}
-		}
-		else
-		{
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
-		}
-	}
+                processQueue();
+            }
+            else if (status.MPI_TAG == TAG_LAMPORT_ACK)
+            {
+                int receivedTime;
+                MPI_Recv(&receivedTime, 1, MPI_INT, status.MPI_SOURCE, TAG_LAMPORT_ACK, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+                std::lock_guard<std::mutex> lock(queueMtx);
+
+                tick(receivedTime);
+
+                lastKnownTime[status.MPI_SOURCE] = std::max(lastKnownTime[status.MPI_SOURCE], receivedTime);
+
+                processQueue();
+            }
+            else
+            {
+                MPI_Recv(NULL, 0, MPI_BYTE, status.MPI_SOURCE, status.MPI_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+        }
+        else
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
 }
 
-void DSM::handleWrite(WriteMessage message)
+void DSM::processQueue()
 {
-	std::lock_guard<std::mutex> lock(mtx);
-	data[message.varName] = message.value;
-}
+    while (!holdbackQueue.empty())
+    {
+        LamportMessage msg = holdbackQueue.top();
 
-void DSM::handleCAS(CASMessage message, int source)
-{
-	CASResponse response;
-	strcpy(response.varName, message.varName);
-	response.result = false;
-	{
-		std::lock_guard<std::mutex> lock(mtx);
-		if (data[message.varName] == message.expectedValue)
-		{
-			data[message.varName] = message.newValue;
-			broadcastUpdate(message.varName, message.newValue);
-			response.result = true;
-		}
-	}
+        bool isStable = true;
+        bool triggerCallback = false;
 
-	MPI_Send(&response, sizeof(response), MPI_BYTE, source, 3, MPI_COMM_WORLD); // tag 3 for sending CAS result
+        if (subscriberList.count(msg.varName))
+        {
+            const std::vector<int>& subscribers = subscriberList[msg.varName];
+            for (int subRank : subscribers)
+            {
+                if (subRank == msg.senderRank || subRank == rank) continue;
+                if (lastKnownTime[subRank] <= msg.timestamp) {
+                    isStable = false;
+                    break;
+                }
+            }
+        }
+        else 
+        {
+            isStable = false;
+        }
+
+        if (!isStable) break;
+
+        {
+            // Execute message
+            bool isSubscribed = (subscriptions.count(msg.varName) > 0);
+
+            if (msg.isCAS)
+            {
+                std::lock_guard<std::mutex> dataLock(mtx);
+                int currentVal = isSubscribed ? data[msg.varName] : 0;
+                bool success = (isSubscribed && currentVal == msg.expectedValue);
+                if (success) data[msg.varName] = msg.value;
+                triggerCallback = success;
+
+                if (msg.senderRank == rank && casPromises.count(msg.timestamp)) 
+                {
+                    std::lock_guard<std::mutex> pLock(casPromiseMtx);
+                    casPromises[msg.timestamp].set_value(success);
+                    casPromises.erase(msg.timestamp);
+                }
+            }
+            else if (isSubscribed)
+            {
+                data[msg.varName] = msg.value;
+                triggerCallback = true;
+            }
+        }
+
+        if (triggerCallback && updateCallback) {
+            updateCallback(msg.varName, msg.value);
+        }
+
+        holdbackQueue.pop();
+    }
 }

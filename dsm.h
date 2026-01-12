@@ -8,71 +8,69 @@
 #include <future>
 #include <iostream>
 #include <set>
+#include <queue>
 
-#define MSG_UPDATE 10
-#define MSG_ACK    11
+// Tags
+#define TAG_LAMPORT_MSG 10
+#define TAG_LAMPORT_ACK 11
 
-struct WriteMessage {
-	char varName[32];
-	int value;
-};
 
-struct CASMessage {
-	char varName[32];
-	int expectedValue;
-	int newValue;
-};
-
-struct CASResponse {
-	char varName[32];
-	bool result;
-};
-
-struct PendingUpdate {
+struct LamportMessage {
 	int timestamp;
-	int sender;
-	char varname[32];
+	int senderRank;
+	char varName[32];
 	int value;
-	int expected;
-	int newValue;
-	int msgType;
-	std::set<int> acks;
+
+	bool isCAS;
+	int expectedValue;
+	
+	bool operator>(const LamportMessage& other) const {
+		if (timestamp != other.timestamp)
+			return timestamp > other.timestamp;
+		return senderRank > other.senderRank;
+	}
 };
 
 class DSM {
 private:
 	std::map<std::string, int> data;
-	std::mutex mtx;
+	std::map<std::string, bool> subscriptions;
 	std::map<std::string, std::vector<int>> subscriberList;
+	std::vector<int> myPeers;
+	std::mutex mtx;
 	std::thread listenerThread;
 	std::atomic<bool> keepRunning;
-	std::map<std::string, std::promise<CASResponse>> pendingCAS;
-	std::mutex casMtx;
 
 	int lamportClock;
-	std::mutex orderMtx;
-	std::map<std::string, std::vector<PendingUpdate>> holdbackQueue;
-	std::map<std::pair<int, int>, std::promise<bool>> casPromises;
+	std::mutex queueMtx;     
+	std::vector<int> lastKnownTime;
+	std::priority_queue<LamportMessage, std::vector<LamportMessage>, std::greater<LamportMessage>> holdbackQueue;
+	std::map<int, std::promise<bool>> casPromises;
+	std::mutex casPromiseMtx;
+
+	std::function<void(std::string, int)> updateCallback;
+
+	int rank;
+	int size;
 
 public:
 	DSM(int argc, char** argv);
-	void initTopology();
 	void subscribe(std::string varName);
 
 	int read(std::string varName);
 	void write(std::string varName, int value);
 	bool compareAndExchange(std::string varName, int expectedValue, int newValue);
-	void broadcastUpdate(std::string varName, int value);
+	void setCallback(std::function<void(std::string, int)> cb);
 
-	void handleWrite(WriteMessage message);
-	void handleCAS(CASMessage message, int source);
-
-	int getMyRank();
-	int getOwnerOfVariable(std::string varName);
+	int getMyRank() const { return rank; };
+	int getSize() const { return size; }
 
 	void close();
 	~DSM();
 
 private:
+	void initTopology();
 	void listen();
+	void tick(int receivedTime = 0);
+	void processQueue();
 };
